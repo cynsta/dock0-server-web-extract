@@ -335,25 +335,41 @@ async function handleRequest(request) {
 }
 
 async function main() {
-  let payload = "";
   process.stdin.setEncoding("utf8");
 
+  let buffer = "";
   for await (const chunk of process.stdin) {
-    payload += chunk;
+    buffer += chunk;
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line) continue;
+
+      let request;
+      try {
+        request = JSON.parse(line);
+      } catch {
+        process.stdout.write(`${JSON.stringify(jsonRpcError(null, -32700, "Parse error"))}\n`);
+        continue;
+      }
+
+      const response = await handleRequest(request);
+      process.stdout.write(`${JSON.stringify(response)}\n`);
+    }
   }
 
-  await delay(0);
-
-  let request;
-  try {
-    request = JSON.parse(payload.trim());
-  } catch {
-    process.stdout.write(`${JSON.stringify(jsonRpcError(null, -32700, "Parse error"))}\n`);
-    return;
+  const tail = buffer.trim();
+  if (tail) {
+    try {
+      const request = JSON.parse(tail);
+      const response = await handleRequest(request);
+      process.stdout.write(`${JSON.stringify(response)}\n`);
+    } catch {
+      process.stdout.write(`${JSON.stringify(jsonRpcError(null, -32700, "Parse error"))}\n`);
+    }
   }
-
-  const response = await handleRequest(request);
-  process.stdout.write(`${JSON.stringify(response)}\n`);
 }
 
 main().catch((error) => {
