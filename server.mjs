@@ -6,6 +6,7 @@ const SERVER_INFO = { name: "server-web-extract", version: "0.1.0" };
 const DEFAULT_PROTOCOL = "2025-11-25";
 const FETCH_TIMEOUT_MS = 10_000;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
+const FETCH_MAX_ATTEMPTS = 2;
 
 function jsonRpcResult(id, result) {
   return { jsonrpc: "2.0", id: id ?? null, result };
@@ -141,47 +142,91 @@ function isPrivateHostname(hostname) {
   return false;
 }
 
-async function fetchHtml(url) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
-  try {
-    const parsed = new URL(url);
-    if (parsed.protocol !== "https:") {
-      throw new Error("invalid_input: only https URLs are allowed");
-    }
-    if (isPrivateHostname(parsed.hostname)) {
-      throw new Error("invalid_input: private or local hostnames are not allowed");
-    }
-
-    const response = await fetch(parsed, {
-      method: "GET",
-      redirect: "follow",
-      signal: controller.signal,
-      headers: {
-        "user-agent": "dock0-web-extract/0.1"
-      }
-    });
-
-    if (!response.ok) {
-      throw new Error(`upstream_error: HTTP ${response.status}`);
-    }
-
-    const arr = await response.arrayBuffer();
-    if (arr.byteLength > MAX_BODY_BYTES) {
-      throw new Error(`invalid_input: body too large (> ${MAX_BODY_BYTES} bytes)`);
-    }
-
-    const html = new TextDecoder("utf-8").decode(arr);
-    return { html, finalUrl: response.url };
-  } catch (error) {
-    if (error?.name === "AbortError") {
-      throw new Error("timeout: upstream fetch timed out");
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
+function extractErrorCode(error) {
+  if (error && typeof error === "object") {
+    const code =
+      (error.code && String(error.code)) ||
+      (error.cause && typeof error.cause === "object" && error.cause.code
+        ? String(error.cause.code)
+        : "");
+    return code || null;
   }
+  return null;
+}
+
+function formatFetchError(error) {
+  if (error?.name === "AbortError") {
+    return "timeout: upstream fetch timed out";
+  }
+
+  const base = error instanceof Error ? error.message : String(error ?? "unknown_error");
+  const code = extractErrorCode(error);
+
+  return code ? `upstream_error: ${base} (${code})` : `upstream_error: ${base}`;
+}
+
+function isRetryableFetchError(error) {
+  if (error?.name === "AbortError") return false;
+  const code = extractErrorCode(error);
+  if (code && ["ECONNRESET", "ETIMEDOUT", "EAI_AGAIN", "ENOTFOUND", "ECONNREFUSED"].includes(code)) {
+    return true;
+  }
+
+  const msg = (error instanceof Error ? error.message : String(error ?? "")).toLowerCase();
+  return (
+    msg.includes("fetch failed") ||
+    msg.includes("socket hang up") ||
+    msg.includes("connection reset")
+  );
+}
+
+async function fetchHtml(url) {
+  const parsed = new URL(url);
+  if (parsed.protocol !== "https:") {
+    throw new Error("invalid_input: only https URLs are allowed");
+  }
+  if (isPrivateHostname(parsed.hostname)) {
+    throw new Error("invalid_input: private or local hostnames are not allowed");
+  }
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= FETCH_MAX_ATTEMPTS; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    try {
+      const response = await fetch(parsed, {
+        method: "GET",
+        redirect: "follow",
+        signal: controller.signal,
+        headers: {
+          "user-agent": "dock0-web-extract/0.1"
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`upstream_error: HTTP ${response.status}`);
+      }
+
+      const arr = await response.arrayBuffer();
+      if (arr.byteLength > MAX_BODY_BYTES) {
+        throw new Error(`invalid_input: body too large (> ${MAX_BODY_BYTES} bytes)`);
+      }
+
+      const html = new TextDecoder("utf-8").decode(arr);
+      return { html, finalUrl: response.url };
+    } catch (error) {
+      lastError = error;
+      if (attempt < FETCH_MAX_ATTEMPTS && isRetryableFetchError(error)) {
+        await delay(250);
+        continue;
+      }
+      throw new Error(formatFetchError(error));
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw new Error(formatFetchError(lastError));
 }
 
 function listToolsResult() {
